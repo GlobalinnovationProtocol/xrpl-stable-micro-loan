@@ -1,0 +1,40 @@
+[Unit]
+Description=H-kyc RLUSD micro-loan server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Project root on this operator's VPS. Adjust to wherever this repository is deployed.
+WorkingDirectory=/opt/h-kyc
+ExecStart=/usr/bin/node --max-old-space-size=2048 --expose-gc src/server.js
+Restart=on-failure
+RestartSec=5
+
+# Public config only -- no secrets here. HOUSE_ADDRESS receives issuance fees and any excess the
+# fee wallet forwards; FEE_ADDRESS is the automated signer; TREASURY_ADDRESS is the single address
+# allowed to deposit into the fee wallet once the firewall (npm run setup:firewall) is applied.
+Environment=HOUSE_ADDRESS=
+Environment=FEE_ADDRESS=
+Environment=TREASURY_ADDRESS=
+Environment=KYC_FILE=/etc/h-kyc/kyc-approved.txt
+Environment=TRUST_PROXY=1
+Environment=PORT=8080
+Environment=STATE_DIRECTORY=/var/lib/h-kyc
+Environment=SESSION_STORE_FILE=/var/lib/h-kyc/loan-sessions.json
+
+# Credentials are exposed only in the unit's private runtime directory. Use the fee wallet's
+# Regular Key, not the account master key. Xaman credentials are used only by the server signer API.
+LoadCredential=fee_regular_key:/etc/h-kyc/fee_regular_key.cred
+LoadCredential=xaman_api_key:/etc/h-kyc/xaman_api_key.cred
+LoadCredential=xaman_api_secret:/etc/h-kyc/xaman_api_secret.cred
+
+# The service writes its durable loan journal only to systemd's state directory.
+StateDirectory=h-kyc
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

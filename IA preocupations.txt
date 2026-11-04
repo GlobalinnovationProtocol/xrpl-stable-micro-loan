@@ -1,0 +1,31 @@
+Mainnet startup in src/server.js now requires distinct HOUSE_ADDRESS and FEE_ADDRESS, a validated mainnet XRPL connection, KYC file, configured Xaman credentials, and a fee-wallet Regular Key authorized by the validated FEE_ADDRESS account root. It creates mainnet Xaman signing payloads for borrower collateral, lender fee, borrower CheckCash, CheckCancel, and house shortfall transactions. Participant accounts sign and fund their own transactions; no mainnet faucet funding is implemented.
+
+Loan sessions and transaction hashes are written to an atomic local JSON journal, restored at startup, and protected by a single-process lock. Pending collateral sessions are not silently deleted on timeout. The systemd unit stores the journal under /var/lib/h-kyc.
+
+The HTTP service now caps concurrent connections, request duration, header size/count, per-socket request count, tracked client fingerprints, and loan requests per rolling day. Repeated invalid-proof tracking expires and is bounded. These controls are implemented in src/server.js and src/guard.js.
+
+The external security audit has not been completed. The review team should independently exercise the mainnet paths, durable journal interruption/restart cases, Xaman payload resolution and rejection, fee Regular Key authorization, Check replay rejection, settlement payment exactness, resource limits, and error paths. No live mainnet transactions were sent during implementation.
+
+The Testnet demo saves faucet wallet signing seeds in poc/.fifo-demo-v2.json. Protect this file and do not copy it to a public or production machine. Demo default sale proceeds are issuer-funded simulations, not a real DEX sale.
+
+The disclaimer text is a placeholder for the legal team's announcement. The tests only verify program behavior and do not assess legal terms.
+
+The saved Testnet journal's collateral attempt was found in validated borrower
+transaction history with result `tecUNFUNDED`; it did not create an escrow.
+The borrower faucet wallet had 100 XRP while the collateral quote required about
+129.7 XRP plus ledger reserve. The journal now records this failed attempt,
+retains its validated hash/result, and releases the unused FIFO reservation. A
+subsequent demo loan completed as `settled_excess`. The demo verifies failed
+submissions and active escrows before releasing reservations, and tops up
+Testnet borrower XRP from the demo issuer only when the issuer can retain its
+validated reserve. It does not retry the failed transaction or erase its record.
+
+The demo remains Testnet-only. Default collateral-sale proceeds are issuer-funded
+simulations, not a real DEX sale. A separate `DEMO_STATE_FILE` is available for
+an independent Testnet run.
+
+The mainnet code path and automatic settlement are now wired to the configured
+mainnet XRPL client and Xaman client. Settlement uses validated ledger transactions,
+stable-price checks, proof of exact collateral release, and verified sale proceeds.
+The code must still be independently examined and exercised by the external audit
+team before it is described as audit-cleared.
