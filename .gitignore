@@ -4,3 +4,4 @@ var/
 .env
 .env.*
 poc/.fifo-demo*.json
+poc/recording-*.txt
