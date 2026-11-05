@@ -122,6 +122,18 @@ export function verifyValidatedCheckCash(tx, expected) {
     );
 }
 
+// A CheckCash that the ledger validated but REJECTED (tec*: unfunded lender, Check gone, frozen
+// line...). Proof that a lender can no longer fund, used to drop them and move to the next one.
+export function verifyValidatedFailedCheckCash(tx, expected) {
+  tx = normalizeTransaction(tx);
+  return tx?.validated === true &&
+    typeof tx?.meta?.TransactionResult === "string" &&
+    tx.meta.TransactionResult.startsWith("tec") &&
+    tx?.TransactionType === "CheckCash" &&
+    tx.Account === expected.borrower &&
+    tx.CheckID?.toUpperCase() === expected.checkId?.toUpperCase();
+}
+
 export function verifyValidatedCheckCancel(tx, expected) {
   tx = normalizeTransaction(tx);
   return tx?.validated === true &&

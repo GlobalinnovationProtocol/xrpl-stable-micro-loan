@@ -6,7 +6,7 @@ import { IpGuard } from "./guard.js";
 import { KycRegistry } from "./kyc.js";
 import { buildCollateralEscrowPayload, buildRepaymentPayload, isAddress, quote } from "./loan.js";
 import {
-  allocateFifoChecks, buildCheckCancel, buildCheckCash, validateLoanAmount,
+  allocateFifoChecks, buildCheckCancel, buildCheckCash, LOAN_UNIT, validateLoanAmount,
 } from "./lenderFifo.js";
 import { createCollateralCondition } from "./escrow.js";
 import { LoanSessionStore } from "./loanSession.js";
@@ -18,7 +18,7 @@ import { loadFeeWallet } from "./settlement/wallets.js";
 import { loadXamanClient } from "./settlement/xaman.js";
 import { runSettlement as runLoanSettlement } from "./settlement/settle.js";
 import {
-  issuedTokenBalance, makePriceProvider, ammPool, verifyBorrowerCheckCash, verifyBorrowerPayment,
+  issuedTokenBalance, makePriceProvider, ammPool, verifyBorrowerCheckCash, verifyBorrowerFailedCheckCash, verifyBorrowerPayment,
   verifyCollateralEscrow, verifyLenderCheck, verifyLenderCheckCancel,
 } from "./xrpl.js";
 import { TERMS_TEXT, TERMS_VERSION, termsAccepted } from "./terms.js";
@@ -48,7 +48,7 @@ function reply(res, status, body) {
 
 export function createLoanServer({
   house, kyc, guard = new IpGuard(), priceProvider, verifyEscrow, verifyLenderCheck,
-  getLenderBalance, verifyCheckCash, verifyLoanFee, verifyCheckCancel,
+  getLenderBalance, verifyCheckCash, verifyFailedCheckCash, verifyLoanFee, verifyCheckCancel,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   settlement = house, sessions = new LoanSessionStore(), runSettlement, xamanClient,
 } = {}) {
@@ -164,6 +164,94 @@ export function createLoanServer({
     };
   };
 
+  // Is this lender still able to fund `offer` right now? Check still on the validated ledger and
+  // enough stablecoin on the account once other in-flight loans' reservations are taken out.
+  const liveOffer = async (session, offer) => {
+    const proof = await verifyLenderCheck(offer.txHash, { lender: offer.lender, borrower: session.borrower, amount: offer.amount });
+    if (!proof || proof.checkId !== offer.checkId) return { ok: false, reason: "FIFO Check cancelled or spent" };
+    const own = session.lenderAllocations.slice(session.nextCheckCash)
+      .filter((a) => a.lender === offer.lender).reduce((sum, a) => sum + a.amount, 0);
+    const balance = await getLenderBalance(offer.lender);
+    if (!Number.isFinite(balance) || balance < 0) throw new Error("unable to verify lender token balance");
+    const available = balance - sessions.reservedBalance(offer.lender) + own;
+    return available >= offer.amount ? { ok: true } : { ok: false, reason: `insufficient ${STABLE_SYMBOL} balance (${available} available)` };
+  };
+
+  // Re-verify every not-yet-cashed allocation; drop lenders who left, refill from the standby
+  // offers in FIFO order. Cashed allocations are untouched. Returns whether the loan is still covered.
+  const refreshFunding = async (session, { forceDrop = [] } = {}) => {
+    initializeSession(session);
+    const target = session.principal;
+    const cashed = session.lenderAllocations.slice(0, session.nextCheckCash);
+    const kept = [];
+    const dropped = [];
+    for (const allocation of session.lenderAllocations.slice(session.nextCheckCash)) {
+      const verdict = forceDrop.includes(allocation.checkId)
+        ? { ok: false, reason: "CheckCash rejected by the ledger" }
+        : await liveOffer(session, allocation);
+      if (verdict.ok) kept.push(allocation);
+      else dropped.push({ ...allocation, reason: verdict.reason, droppedAt: Date.now() });
+    }
+    let covered = cashed.reduce((sum, a) => sum + a.amount, 0) + kept.reduce((sum, a) => sum + a.amount, 0);
+    const standby = [];
+    const used = new Set([...cashed, ...kept].map((a) => a.checkId));
+    const ordered = [...(session.standbyOffers ?? [])].sort((a, b) => a.ledgerIndex - b.ledgerIndex || a.transactionIndex - b.transactionIndex);
+    for (const offer of ordered) {
+      if (used.has(offer.checkId) || dropped.some((d) => d.checkId === offer.checkId)) continue;
+      if (covered >= target) { standby.push(offer); continue; }
+      if (sessions.isReserved(offer.checkId) || !kyc.isApproved(offer.lender) || offer.lender === session.borrower) continue;
+      const verdict = await liveOffer(session, offer);
+      if (!verdict.ok) continue;
+      kept.push({ lender: offer.lender, checkId: offer.checkId, amount: offer.amount, ledgerIndex: offer.ledgerIndex, transactionIndex: offer.transactionIndex, txHash: offer.txHash });
+      used.add(offer.checkId);
+      covered += offer.amount;
+    }
+    kept.sort((a, b) => a.ledgerIndex - b.ledgerIndex || a.transactionIndex - b.transactionIndex);
+    const allocations = [...cashed, ...kept];
+    const changed = dropped.length > 0 || allocations.length !== session.lenderAllocations.length ||
+      allocations.some((a, i) => a.checkId !== session.lenderAllocations[i].checkId) ||
+      standby.length !== (session.standbyOffers ?? []).length;
+    if (changed) sessions.replaceAllocations(session.loanId, { allocations, standbyOffers: standby, dropped });
+    if (allocations.length && !session.feePaid && session.lender !== allocations[0].lender) {
+      sessions.update(session.loanId, { lender: allocations[0].lender });
+    } else if (session.feePaid && allocations.length && !allocations.some((a) => a.lender === session.lender) && !session.feeRefundDue) {
+      // The fee was paid by a lender who then left: the house owes it back; recorded, never silently kept.
+      sessions.update(session.loanId, { feeRefundDue: { lender: session.lender, amount: session.issuanceFee } });
+    }
+    return { ok: covered >= target, shortfall: Math.max(0, target - covered), dropped, allocations };
+  };
+
+  const shortfallReply = (session, refresh) => ({
+    loanId: session.loanId,
+    fundingShortfall: refresh.shortfall,
+    droppedLenders: refresh.dropped.map((d) => ({ lender: d.lender, reason: d.reason })),
+    lenderAllocations: refresh.allocations,
+    action: "add more FIFO lender Checks for this borrower via /loan/funding/add",
+  });
+
+  // Validate borrower-supplied CheckCreate proofs into live offers; unavailable ones are skipped (not refused).
+  const collectOffers = async (session, lenderChecks, borrower, { skipped }) => {
+    const offers = [];
+    for (const [index, candidate] of lenderChecks.entries()) {
+      if (!candidate || !isAddress(candidate.lender) || candidate.lender === borrower) throw Object.assign(new Error("distinct valid lender required"), { status: 400 });
+      if (!kyc.isApproved(candidate.lender)) throw Object.assign(new Error("KYC approval required for every FIFO lender"), { status: 403 });
+      try { validateLoanAmount(candidate.amount); } catch (error) { throw Object.assign(new Error(`invalid FIFO offer: ${error.message}`), { status: 400 }); }
+      const proof = await verifyLenderCheck(candidate.txHash, { lender: candidate.lender, borrower, amount: candidate.amount });
+      if (!proof) { skipped.push({ lender: candidate.lender, reason: "FIFO Check cancelled, spent or not validated" }); continue; }
+      if (sessions.isReserved(proof.checkId) && !(session?.lenderAllocations ?? []).some((a) => a.checkId === proof.checkId)) {
+        skipped.push({ lender: candidate.lender, reason: "FIFO Check reserved by another loan" }); continue;
+      }
+      const balance = await getLenderBalance(candidate.lender);
+      if (!Number.isFinite(balance) || balance < 0) throw Object.assign(new Error("unable to verify lender token balance"), { status: 503 });
+      offers.push({
+        lender: candidate.lender, checkId: proof.checkId, amount: candidate.amount, txHash: candidate.txHash,
+        balance: balance - sessions.reservedBalance(candidate.lender), status: "validated_available",
+        ledgerIndex: proof.ledgerIndex, transactionIndex: proof.transactionIndex ?? index,
+      });
+    }
+    return offers;
+  };
+
   const createSigningPayload = async (session, key, txjson, instruction) => {
     if (!xamanClient) return undefined;
     const existingUuid = session[`${key}PayloadUuid`];
@@ -204,6 +292,7 @@ export function createLoanServer({
     if (req.method !== "POST" || ![
       "/loan/request", "/loan/confirm", "/loan/fee/confirm",
       "/loan/disbursement/confirm", "/loan/funding/confirm", "/loan/deficit/confirm",
+      "/loan/funding/retry", "/loan/funding/add",
     ].includes(route)) {
       return reply(res, 404, { error: "not found" });
     }
@@ -290,6 +379,9 @@ export function createLoanServer({
           } else if (session.status !== "collateral_locked" || session.collateralHash !== collateralHash) {
             return reply(res, 409, { error: "loan is not awaiting this collateral confirmation" });
           }
+          // The borrower's XRP is now locked: make sure the lenders can still fund before asking anyone to pay.
+          const refresh = await refreshFunding(session);
+          if (!refresh.ok) return reply(res, 200, { confirmed: true, ...shortfallReply(session, refresh) });
           const feeTransaction = {
             TransactionType: "Payment", Account: session.lender, Destination: house,
             Amount: { currency: TOKEN_CURRENCY, issuer: TOKEN_ISSUER, value: String(session.issuanceFee) },
@@ -328,6 +420,8 @@ export function createLoanServer({
           } else if (session.feeHash !== hash) {
             return reply(res, 409, { error: "a different fee transaction has already been accepted" });
           }
+          const refresh = await refreshFunding(session);
+          if (!refresh.ok) return reply(res, 200, { feePaid: true, ...shortfallReply(session, refresh) });
           const allocation = session.lenderAllocations[0];
           const cashTransaction = buildCheckCash({
             borrower: session.borrower, checkId: allocation.checkId,
@@ -438,6 +532,63 @@ export function createLoanServer({
           });
         }
 
+        if (route === "/loan/funding/retry") {
+          // The borrower tried to cash the next FIFO Check and the ledger rejected it (tec*): the
+          // lender left. Prove it with the failed transaction, drop that lender, move to the next.
+          if (!verifyFailedCheckCash) return reply(res, 503, { error: "failed CheckCash verification not configured" });
+          const session = sessions.get(body.loanId);
+          if (!session || session.status !== "collateral_locked" || !session.feePaid) {
+            return reply(res, 409, { error: "funding retry is only possible after collateral and fee" });
+          }
+          const allocation = session.lenderAllocations[session.nextCheckCash];
+          if (!allocation) return reply(res, 409, { error: "no pending FIFO Check to retry" });
+          const hash = typeof body.txHash === "string" ? body.txHash.toUpperCase() : "";
+          if (!await verifyFailedCheckCash(hash, { borrower: session.borrower, checkId: allocation.checkId })) {
+            guard.recordInvalidAttempt(ip);
+            return reply(res, 409, { error: "no validated failed CheckCash for the pending FIFO Check" });
+          }
+          const refresh = await refreshFunding(session, { forceDrop: [allocation.checkId] });
+          if (!refresh.ok) return reply(res, 200, { feePaid: true, ...shortfallReply(session, refresh) });
+          return reply(res, 200, { ...(await fundingResponse(session)), droppedLenders: refresh.dropped.map((d) => ({ lender: d.lender, reason: d.reason })) });
+        }
+
+        if (route === "/loan/funding/add") {
+          // More FIFO lender Checks (to this borrower) to cover a shortfall after lenders left.
+          if (!verifyLenderCheck || !getLenderBalance) return reply(res, 503, { error: "live lender Check and balance verification is not configured" });
+          const session = sessions.get(body.loanId);
+          if (!session || !["pending_collateral", "collateral_locked"].includes(session.status)) {
+            return reply(res, 409, { error: "loan is not accepting additional lenders" });
+          }
+          if (!Array.isArray(body.lenderChecks) || body.lenderChecks.length === 0 || body.lenderChecks.length > 20) {
+            return reply(res, 400, { error: "lenderChecks must contain 1 to 20 FIFO CheckCreate proofs" });
+          }
+          const skipped = [];
+          let added;
+          try {
+            added = await collectOffers(session, body.lenderChecks, session.borrower, { skipped });
+          } catch (error) {
+            if (error.status) return reply(res, error.status, { error: error.message });
+            throw error;
+          }
+          const known = new Set([...session.lenderAllocations, ...(session.standbyOffers ?? [])].map((o) => o.checkId));
+          sessions.update(body.loanId, { standbyOffers: [...(session.standbyOffers ?? []), ...added.filter((o) => !known.has(o.checkId))] });
+          const refresh = await refreshFunding(session);
+          if (!refresh.ok) return reply(res, 200, { ...shortfallReply(session, refresh), skippedLenders: skipped });
+          if (session.status === "pending_collateral") {
+            return reply(res, 200, { loanId: session.loanId, funded: false, lenderAllocations: session.lenderAllocations, skippedLenders: skipped });
+          }
+          if (!session.feePaid) {
+            const feeTransaction = {
+              TransactionType: "Payment", Account: session.lender, Destination: house,
+              Amount: { currency: TOKEN_CURRENCY, issuer: TOKEN_ISSUER, value: String(session.issuanceFee) },
+              Memos: [{ Memo: { MemoData: Buffer.from(session.loanId).toString("hex").toUpperCase() } }],
+            };
+            const feeSigning = await createSigningPayload(session, "fee", feeTransaction, `Pay the ${session.issuanceFee} ${STABLE_SYMBOL} loan fee for loan ${session.loanId}`);
+            return reply(res, 200, { loanId: session.loanId, nextLenderLoanFee: feeTransaction, lenderAllocations: session.lenderAllocations, skippedLenders: skipped, ...(feeSigning ? { signing: feeSigning } : {}) });
+          }
+          return reply(res, 200, { ...(await fundingResponse(session)), skippedLenders: skipped });
+        }
+
         if (route === "/loan/funding/confirm") {
           const session = sessions.get(body.loanId);
           if (!session || session.status !== "collateral_locked" ||
@@ -518,53 +669,45 @@ export function createLoanServer({
         if (!verifyLenderCheck || !getLenderBalance) {
           return reply(res, 503, { error: "live lender Check and balance verification is not configured" });
         }
-        const offers = [];
-        for (const [index, candidate] of body.lenderChecks.entries()) {
-          if (!candidate || !isAddress(candidate.lender) || candidate.lender === borrower) {
-            return reply(res, 400, { error: "distinct valid lender required" });
-          }
-          if (!kyc.isApproved(candidate.lender)) {
-            guard.recordInvalidAttempt(ip);
-            return reply(res, 403, { error: "KYC approval required for every FIFO lender" });
-          }
-          try {
-            validateLoanAmount(candidate.amount);
-          } catch (error) {
-            return reply(res, 400, { error: `invalid FIFO offer: ${error.message}` });
-          }
-          const proof = await verifyLenderCheck(candidate.txHash, {
-            lender: candidate.lender, borrower, amount: candidate.amount,
-          });
-          if (!proof) {
-            guard.recordInvalidAttempt(ip);
-            return reply(res, 409, { error: "lender CheckCreate is not a validated active Check for this borrower" });
-          }
-          const balance = await getLenderBalance(candidate.lender);
-          if (!Number.isFinite(balance) || balance < 0) {
-            return reply(res, 503, { error: "unable to verify lender token balance" });
-          }
-          offers.push({
-            lender: candidate.lender, checkId: proof.checkId, amount: candidate.amount,
-            balance: balance - sessions.reservedBalance(candidate.lender), status: "validated_available",
-            ledgerIndex: proof.ledgerIndex, transactionIndex: proof.transactionIndex ?? index,
-          });
+        const skipped = [];
+        let offers;
+        try {
+          offers = await collectOffers(undefined, body.lenderChecks, borrower, { skipped });
+        } catch (error) {
+          if (error.status === 403) guard.recordInvalidAttempt(ip);
+          if (error.status) return reply(res, error.status, { error: error.message });
+          throw error;
         }
+        if (!offers.length) return reply(res, 409, { error: "no available FIFO lender Check", skippedLenders: skipped });
         if (!priceProvider) return reply(res, 503, { error: "price source not configured" });
         const second = await requireStablePrice(priceProvider, { sleep });
 
         const terms = quote(second.price, principal);
+        // Prices took up to a minute: re-read every Check and balance right before allocating.
         for (const offer of offers) {
-          const candidate = body.lenderChecks.find((c) => c.lender === offer.lender);
-          const proof = await verifyLenderCheck(candidate.txHash, { lender: offer.lender, borrower, amount: offer.amount });
-          if (!proof || proof.checkId !== offer.checkId) return reply(res, 409, { error: "FIFO Check no longer available" });
+          const proof = await verifyLenderCheck(offer.txHash, { lender: offer.lender, borrower, amount: offer.amount });
+          if (!proof || proof.checkId !== offer.checkId) {
+            offer.status = "unavailable";
+            skipped.push({ lender: offer.lender, reason: "FIFO Check cancelled or spent during pricing" });
+            continue;
+          }
           offer.balance = await getLenderBalance(offer.lender) - sessions.reservedBalance(offer.lender);
+        }
+        for (const offer of offers) {
+          if (offer.status === "validated_available" && offer.balance < LOAN_UNIT) {
+            skipped.push({ lender: offer.lender, reason: `insufficient ${STABLE_SYMBOL} balance (${offer.balance} available)` });
+          }
         }
         let lenderAllocations;
         try {
           lenderAllocations = allocateFifoChecks(principal, offers, (address) => kyc.isApproved(address));
         } catch (error) {
-          return reply(res, 409, { error: error.message });
+          return reply(res, 409, { error: error.message, skippedLenders: skipped });
         }
+        const allocatedIds = new Set(lenderAllocations.map((a) => a.checkId));
+        for (const allocation of lenderAllocations) allocation.txHash = offers.find((o) => o.checkId === allocation.checkId)?.txHash;
+        const standbyOffers = offers.filter((o) => o.status === "validated_available" && !allocatedIds.has(o.checkId) && o.balance >= LOAN_UNIT)
+          .map(({ lender, checkId, amount, txHash, ledgerIndex, transactionIndex }) => ({ lender, checkId, amount, txHash, ledgerIndex, transactionIndex }));
         if (guard.dailyCapReached(sessions.inFlightCount())) return reply(res, 429, { error: "daily loan capacity reached" });
         const { condition, fulfillment } = createCollateralCondition();
         const collateralDrops = Number(xrpToDrops(terms.collateralXrp));
@@ -573,7 +716,7 @@ export function createLoanServer({
         const loanId = sessions.create({
           lender: lenderAllocations[0].lender, borrower, destination: settlement, minDrops: collateralDrops,
           condition, fulfillment, finishAfter, cancelAfter,
-          principal, issuanceFee: terms.issuanceFee, lenderAllocations, requester, house,
+          principal, issuanceFee: terms.issuanceFee, lenderAllocations, standbyOffers, requester, house,
         });
         const collateralEscrow = buildCollateralEscrowPayload({
           borrower, destination: settlement, collateralDrops, condition, finishAfter, cancelAfter,
@@ -587,6 +730,8 @@ export function createLoanServer({
           sessionToken: sessions.get(loanId).sessionToken,
           terms,
           lenderAllocations,
+          standbyLenders: standbyOffers.map((o) => o.lender),
+          skippedLenders: skipped,
           unsigned: {
             collateralEscrow,
           },
@@ -678,6 +823,7 @@ export async function main() {
       verifyCheckCash: (hash, expected) => verifyBorrowerCheckCash(hash, expected),
       verifyLoanFee: (hash, expected) => verifyBorrowerPayment(hash, expected),
       verifyCheckCancel: (hash, expected) => verifyLenderCheckCancel(hash, expected),
+      verifyFailedCheckCash: (hash, expected) => verifyBorrowerFailedCheckCash(hash, expected),
       runSettlement: (session) => runLoanSettlement(session, {
         client, feeWallet, houseAddress: house, priceProvider, poolProvider: () => ammPool(), xummClient: xamanClient,
       }),

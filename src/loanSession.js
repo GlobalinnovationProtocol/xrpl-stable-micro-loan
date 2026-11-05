@@ -116,14 +116,14 @@ export class LoanSessionStore {
 
   create({
     lender, borrower, destination, minDrops, condition, fulfillment, finishAfter, cancelAfter,
-    principal, issuanceFee, lenderAllocations = [], requester, house,
+    principal, issuanceFee, lenderAllocations = [], standbyOffers = [], requester, house,
   }) {
     if (lenderAllocations.some((a) => this.#reserved.has(a.checkId))) throw new Error("FIFO Check already reserved");
     const loanId = randomUUID();
     for (const allocation of lenderAllocations) this.#reserved.add(allocation.checkId);
     this.#sessions.set(loanId, this.#track({
       loanId, lender, borrower, destination, minDrops, condition, fulfillment,
-      finishAfter, cancelAfter, principal, issuanceFee, lenderAllocations,
+      finishAfter, cancelAfter, principal, issuanceFee, lenderAllocations, standbyOffers, droppedAllocations: [],
       requester, house, sessionToken: randomUUID(),
       nextCheckCash: 0, feePaid: false, verifyingCheckCash: false, verifyingEscrow: false,
       status: "pending_collateral", createdAt: Date.now(),
@@ -136,6 +136,33 @@ export class LoanSessionStore {
       throw error;
     }
     return loanId;
+  }
+
+  isReserved(checkId) {
+    return this.#reserved.has(checkId);
+  }
+
+  // Swap the not-yet-cashed tail of a session's allocations (lender left, Check cancelled, balance
+  // gone) for replacements. Cashed allocations are never touched; reservations follow the change.
+  replaceAllocations(loanId, { allocations, standbyOffers, dropped = [] }) {
+    const session = this.#sessions.get(loanId);
+    if (!session) return false;
+    const cashed = session.lenderAllocations.slice(0, session.nextCheckCash);
+    if (allocations.slice(0, cashed.length).some((a, i) => a.checkId !== cashed[i].checkId)) {
+      throw new Error("cashed FIFO allocations cannot be replaced");
+    }
+    const previous = new Set(session.lenderAllocations.slice(session.nextCheckCash).map((a) => a.checkId));
+    const next = new Set(allocations.slice(session.nextCheckCash).map((a) => a.checkId));
+    for (const id of next) if (!previous.has(id) && this.#reserved.has(id)) throw new Error("FIFO Check already reserved");
+    const ok = this.update(loanId, {
+      lenderAllocations: allocations,
+      standbyOffers,
+      droppedAllocations: [...(session.droppedAllocations ?? []), ...dropped],
+    });
+    if (!ok) return false;
+    for (const id of previous) if (!next.has(id)) this.#reserved.delete(id);
+    for (const id of next) this.#reserved.add(id);
+    return true;
   }
 
   reservedBalance(lender) {

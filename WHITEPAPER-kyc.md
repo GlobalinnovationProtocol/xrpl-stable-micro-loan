@@ -46,3 +46,7 @@ The three settlement choices continue after loan opening.
 
 See [UBUNTU.md](UBUNTU.md) for commands, endpoint contracts and the current
 mainnet entry-point configuration status.
+
+Lender exit: a lender withdraws at any time (CheckCancel or moving funds). The service re-reads the ledger before every
+funding step, skips lenders who left and serves the loan from the next lender in FIFO order; a shortfall is reported and
+additional lender Checks can be added (see AUDIT-READINESS.md, "Lender exit and FIFO re-allocation").

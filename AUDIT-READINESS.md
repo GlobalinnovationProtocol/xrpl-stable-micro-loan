@@ -106,3 +106,25 @@ Entries without a verified official XRPL mainnet issuer (USDC, USDT, wDAI today)
 check in `src/xrpl.js`, `src/settlement/*.js` and `src/loan.js` reads `STABLE_CURRENCY` / `STABLE_ISSUER`, so enabling a
 second stablecoin later is a one-line allowlist change under the same audited code, not a new branch. `test/stable.test.js`
 covers the default, the refusal of disabled entries and of unknown symbols.
+
+## Lender exit and FIFO re-allocation (2026-11-05)
+
+A lender's FIFO commitment is an XRPL Check they own: they can `CheckCancel` it or move their stablecoins out at any time;
+nothing in the protocol prevents that, by design. The service therefore never trusts an offer without re-reading the
+validated ledger:
+
+- `/loan/request`: each supplied Check is verified (`ledger_entry`) and the lender's live balance read; unavailable
+  lenders are **skipped** (reported in `skippedLenders`) instead of failing the request; the loan is allocated to the next
+  FIFO lender (`allocateFifoChecks`). Offers not needed are kept as `standbyOffers` on the session.
+- `/loan/confirm` (XRP escrow validated) and `/loan/fee/confirm`: before asking anyone to pay, `refreshFunding()` re-verifies
+  every not-yet-cashed allocation and replaces lenders who left with standby offers in FIFO order. The fee is requested from
+  the lender who actually funds.
+- `/loan/funding/retry`: if the ledger rejects a CheckCash (validated `tec*`), the borrower submits that hash as proof
+  (`verifyValidatedFailedCheckCash`); the lender is dropped and the next lender's Check is offered. If the dropped lender
+  had already paid the 25 fee, `feeRefundDue` is recorded on the session for the house to refund.
+- `/loan/funding/add`: additional FIFO Checks for the same borrower can be supplied to cover a shortfall at any stage.
+- Cashed allocations are never replaced; reservations follow the change (`LoanSessionStore.replaceAllocations`).
+
+Residual exposure: if no lender at all can fund after the escrow is locked, the borrower's XRP stays in escrow until
+`CancelAfter` unless new Checks are added. A house-as-lender-of-last-resort policy is recommended operationally.
+`test/fifoRealloc.test.js` covers skip-at-request, re-allocation at confirm, shortfall + add, and the failed-cash retry.

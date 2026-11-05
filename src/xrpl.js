@@ -1,7 +1,7 @@
 import { STABLE_CURRENCY, STABLE_ISSUER, STABLE_SYMBOL } from "./params.js";
 import {
   normalizeTransaction, verifyValidatedCheckCancel, verifyValidatedCheckCash,
-  verifyValidatedCheckCreate, verifyValidatedCollateral,
+  verifyValidatedCheckCreate, verifyValidatedCollateral, verifyValidatedFailedCheckCash,
 } from "./lenderFifo.js";
 
 export const XRPL_URL = "https://xrplcluster.com/";
@@ -141,6 +141,12 @@ export async function verifyLenderCheckCancel(txHash, expected, fetchImpl) {
   if (!/^[0-9A-Fa-f]{64}$/.test(txHash ?? "")) return false;
   const tx = await rpc("tx", { transaction: txHash, binary: false }, fetchImpl);
   return verifyValidatedCheckCancel(tx, expected);
+}
+
+export async function verifyBorrowerFailedCheckCash(txHash, expected, fetchImpl) {
+  if (!/^[0-9A-Fa-f]{64}$/.test(txHash ?? "")) return false;
+  const tx = await rpc("tx", { transaction: txHash, binary: false }, fetchImpl);
+  return verifyValidatedFailedCheckCash(tx, expected);
 }
 
 export async function verifyBorrowerPayment(txHash, expected, fetchImpl) {
